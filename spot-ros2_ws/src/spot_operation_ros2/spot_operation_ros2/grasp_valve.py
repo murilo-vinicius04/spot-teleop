@@ -14,8 +14,8 @@ from rclpy.action import ActionClient
 from std_srvs.srv import Trigger
 from std_msgs.msg import Float64
 from vision_msgs.msg import Detection3DArray
-from geometry_msgs.msg import PoseStamped, Pose
-from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+from geometry_msgs.msg import PoseStamped, Pose, TransformStamped
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException, TransformException
 from tf2_geometry_msgs import do_transform_pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
@@ -28,6 +28,11 @@ import numpy as np
 from pathlib import Path
 import time
 from collections import deque
+import math
+from moveit_msgs.srv import GetCartesianPath
+from moveit_msgs.action import ExecuteTrajectory
+from control_msgs.action import FollowJointTrajectory
+import tf_transformations
 
 
 class ValveGraspNode(Node):
@@ -76,6 +81,42 @@ class ValveGraspNode(Node):
         self.get_logger().info(f"Planning group: {self.PLANNING_GROUP}")
         self.get_logger().info(f"End effector: {self.END_EFFECTOR_LINK}")
         self.get_logger().info(f"Planning frame: {self.PLANNING_FRAME}")
+        
+        # Cartesian path service
+        self.cartesian_client = self.create_client(
+            GetCartesianPath,
+            '/compute_cartesian_path',
+            callback_group=self.callback_group
+        )
+        self.get_logger().info("Waiting for /compute_cartesian_path service...")
+        if not self.cartesian_client.wait_for_service(timeout_sec=10.0):
+            self.get_logger().error("GetCartesianPath service not available!")
+            raise RuntimeError("GetCartesianPath service not available")
+        
+        # ExecuteTrajectory action
+        self.exec_traj_client = ActionClient(
+            self,
+            ExecuteTrajectory,
+            '/execute_trajectory',
+            callback_group=self.callback_group
+        )
+        self.get_logger().info("Waiting for /execute_trajectory action server...")
+        if not self.exec_traj_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error("ExecuteTrajectory action server not available!")
+            raise RuntimeError("ExecuteTrajectory action server not available")
+        
+        # FollowJointTrajectory action client
+        self.get_logger().info("Creating FollowJointTrajectory action client...")
+        self.fjt_client = ActionClient(
+            self,
+            FollowJointTrajectory,
+            '/arm_controller/follow_joint_trajectory',
+            callback_group=self.callback_group
+        )
+        self.get_logger().info("Waiting for /arm_controller/follow_joint_trajectory action server...")
+        if not self.fjt_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error("FollowJointTrajectory action server not available!")
+            raise RuntimeError("FollowJointTrajectory action server not available")
         
         # TF2 setup for coordinate transformations
         self.tf_buffer = Buffer()
@@ -137,11 +178,19 @@ class ValveGraspNode(Node):
             callback_group=self.callback_group
         )
         
+        self.close_valve_service = self.create_service(
+            Trigger,
+            'close_valve',
+            self.close_valve_cartesian_callback,
+            callback_group=self.callback_group
+        )
+        
         self.get_logger().info("Valve Grasp Node initialized successfully!")
         self.get_logger().info("Available services:")
         self.get_logger().info("  - /plan_grasp: Plan motion only (no execution, no gripper)")
         self.get_logger().info("  - /execute_grasp: Execute planned motion with pre-grasp")
         self.get_logger().info("  - /grasp_valve: Complete grasp (plan + execute + gripper)")
+        self.get_logger().info("  - /close_valve: Close valve using Cartesian path")
         
         # Open gripper to pre-grasp position on startup
         self.get_logger().info("=" * 60)
@@ -254,6 +303,109 @@ class ValveGraspNode(Node):
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
             self.get_logger().error(f"TF lookup failed ({source_frame} -> {target_frame}): {e}")
             return None
+    
+    def _quat_to_rot(self, q):
+        """Convert quaternion to 3x3 rotation matrix."""
+        x, y, z, w = q.x, q.y, q.z, q.w
+        xx, yy, zz = x*x, y*y, z*z
+        xy, xz, yz = x*y, x*z, y*z
+        wx, wy, wz = w*x, w*y, w*z
+        return np.array([
+            [1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)],
+            [2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)],
+            [2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)]
+        ])
+    
+    def _rot_to_quat(self, R):
+        """Convert 3x3 rotation matrix to quaternion."""
+        from geometry_msgs.msg import Quaternion
+        
+        t = np.trace(R)
+        if t > 0:
+            s = math.sqrt(t+1.0)*2
+            w = 0.25*s
+            x = (R[2,1]-R[1,2])/s
+            y = (R[0,2]-R[2,0])/s
+            z = (R[1,0]-R[0,1])/s
+        else:
+            i = np.argmax([R[0,0], R[1,1], R[2,2]])
+            if i == 0:
+                s = math.sqrt(1.0+R[0,0]-R[1,1]-R[2,2])*2
+                w = (R[2,1]-R[1,2])/s
+                x = 0.25*s
+                y = (R[0,1]+R[1,0])/s
+                z = (R[0,2]+R[2,0])/s
+            elif i == 1:
+                s = math.sqrt(1.0+R[1,1]-R[0,0]-R[2,2])*2
+                w = (R[0,2]-R[2,0])/s
+                x = (R[0,1]+R[1,0])/s
+                y = 0.25*s
+                z = (R[1,2]+R[2,1])/s
+            else:
+                s = math.sqrt(1.0+R[2,2]-R[0,0]-R[1,1])*2
+                w = (R[1,0]-R[0,1])/s
+                x = (R[0,2]+R[2,0])/s
+                y = (R[1,2]+R[2,1])/s
+                z = 0.25*s
+        
+        q = Quaternion()
+        q.x, q.y, q.z, q.w = x, y, z, w
+        return q
+    
+    def _transform_to_matrix(self, tf):
+        """Convert Transform message to 4x4 homogeneous matrix."""
+        t = tf.translation
+        q = tf.rotation
+        R = self._quat_to_rot(q)
+        T = np.eye(4)
+        T[:3,:3] = R
+        T[:3, 3] = np.array([t.x, t.y, t.z])
+        return T
+    
+    def _pose_to_matrix(self, pose):
+        """Convert Pose message to 4x4 homogeneous matrix."""
+        T = np.eye(4)
+        T[:3,:3] = self._quat_to_rot(pose.orientation)
+        T[:3, 3] = np.array([pose.position.x, pose.position.y, pose.position.z])
+        return T
+    
+    def _matrix_to_pose(self, T):
+        """Convert 4x4 homogeneous matrix to Pose message."""
+        from geometry_msgs.msg import Pose
+        
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = T[0,3], T[1,3], T[2,3]
+        q = self._rot_to_quat(T[:3,:3])
+        p.orientation = q
+        return p
+    
+    def _axis_rot(self, theta, axis='z'):
+        """
+        Create a 4x4 rotation matrix around a given axis.
+        
+        Args:
+            theta: Rotation angle in radians
+            axis: 'x', 'y', or 'z'
+        
+        Returns:
+            4x4 homogeneous rotation matrix
+        """
+        R = np.eye(4)
+        c, s = math.cos(theta), math.sin(theta)
+        
+        if axis == 'x':
+            R[:3,:3] = np.array([[1, 0, 0],
+                                 [0, c, -s],
+                                 [0, s, c]])
+        elif axis == 'y':
+            R[:3,:3] = np.array([[c, 0, s],
+                                 [0, 1, 0],
+                                 [-s, 0, c]])
+        else:  # 'z'
+            R[:3,:3] = np.array([[c, -s, 0],
+                                 [s, c, 0],
+                                 [0, 0, 1]])
+        return R
     
     def construct_goal_constraints(self, pose_stamped: PoseStamped, 
                                    tolerance_pos: float = None, 
@@ -428,6 +580,384 @@ class ValveGraspNode(Node):
         self.gripper_cmd_pub.publish(cmd_msg)
         # Wait for gripper to reach position (duration + buffer)
         time.sleep(2.0)
+    
+    def rotate_valve(self, theta_deg=90.0, steps=96, axis='z', max_step=0.001, avoid_collisions=False):
+        """
+        Rotate the valve by describing a circular arc around the valve axis.
+        Uses EE position as the robust reference, computing radial distance in body frame.
+        
+        This approach is more robust than using lever_pivot_aligned directly because:
+        - EE position (arm_link_wr1) is always consistent (from robot odometry)
+        - lever_pivot_aligned is used only to define rotation center (once)
+        - All waypoints are computed in body frame (consistent coordinate system)
+        - Small errors in pivot detection only affect initial position, not arc shape
+        
+        Args:
+            theta_deg: Rotation angle in degrees (default: 90.0)
+            steps: Number of waypoints for smooth motion (default: 96)
+            axis: Rotation axis ('z' for vertical valve rotation, default: 'z')
+            max_step: Cartesian interpolation resolution in meters (default: 0.001)
+            avoid_collisions: Whether to check collisions during planning (default: False)
+        
+        Returns:
+            bool: True if rotation executed successfully, False otherwise
+        """
+        try:
+            theta_rad = math.radians(theta_deg)
+            
+            # Get current EE position in body frame (always consistent)
+            tf_body_ee = self.lookup_transform(self.PLANNING_FRAME, self.END_EFFECTOR_LINK, timeout=3.0)
+            if tf_body_ee is None:
+                self.get_logger().error("Failed to get TF body->EE")
+                return False
+            
+            # Get pivot center in body frame (used only to define rotation center)
+            tf_body_pivot = self.lookup_transform(self.PLANNING_FRAME, "lever_pivot_aligned", timeout=3.0)
+            if tf_body_pivot is None:
+                self.get_logger().error("Failed to get TF body->lever_pivot_aligned")
+                return False
+            
+            # Extract rotation axis from lever_pivot_aligned frame
+            # The Y axis of lever_pivot_aligned is the valve rotation axis (horizontal valve)
+            pivot_rotation = self._quat_to_rot(tf_body_pivot.transform.rotation)
+            axis_vector = pivot_rotation[:, 1]  # Y axis (2nd column) of pivot frame in body coordinates
+            
+            self.get_logger().info(f"Valve axis in body frame: [{axis_vector[0]:.3f}, {axis_vector[1]:.3f}, {axis_vector[2]:.3f}]")
+            
+            # Extract positions in body frame
+            ee_x = tf_body_ee.transform.translation.x
+            ee_y = tf_body_ee.transform.translation.y
+            ee_z = tf_body_ee.transform.translation.z
+            
+            pivot_x = tf_body_pivot.transform.translation.x
+            pivot_y = tf_body_pivot.transform.translation.y
+            pivot_z = tf_body_pivot.transform.translation.z
+            
+            # Compute radius vector (center → EE) in body frame
+            dx = ee_x - pivot_x
+            dy = ee_y - pivot_y
+            dz = ee_z - pivot_z
+            
+            # For valve rotation: use ONLY the distance along the valve axis as radius
+            # If valve is aligned with Y, radius = |dy|
+            # Movement will be in the plane perpendicular to X (i.e., YZ plane)
+            
+            # Determine which axis component to use as radius based on valve orientation
+            axis_components = np.abs(axis_vector)
+            dominant_axis_idx = np.argmax(axis_components)
+            
+            # Map to axis names
+            axis_names = ['X', 'Y', 'Z']
+            valve_axis_name = axis_names[dominant_axis_idx]
+            
+            # Radius is the distance along the valve axis
+            if dominant_axis_idx == 0:  # X axis
+                raio = abs(dx)
+            elif dominant_axis_idx == 1:  # Y axis
+                raio = abs(dy)
+            else:  # Z axis
+                raio = abs(dz)
+            
+            if raio < 0.005:  # Too small (< 5mm)
+                self.get_logger().error(f"Radial distance too small: {raio*1000:.1f} mm")
+                return False
+            
+            self.get_logger().info(f"Valve rotation parameters:")
+            self.get_logger().info(f"  Center (pivot):     [{pivot_x:.3f}, {pivot_y:.3f}, {pivot_z:.3f}]")
+            self.get_logger().info(f"  EE position:        [{ee_x:.3f}, {ee_y:.3f}, {ee_z:.3f}]")
+            self.get_logger().info(f"  Valve axis:         {valve_axis_name} (vector: [{axis_vector[0]:.3f}, {axis_vector[1]:.3f}, {axis_vector[2]:.3f}])")
+            self.get_logger().info(f"  Radial distance:    {raio:.4f} m ({raio*1000:.1f} mm)")
+            
+            # Get initial orientation to maintain it
+            ee_orientation = tf_body_ee.transform.rotation
+            
+            # Generate waypoints: circular arc in plane perpendicular to valve axis
+            # For Y-axis valve (horizontal): arc in YZ plane, X constant
+            waypoints = []
+            
+            if dominant_axis_idx == 1:  # Y axis (horizontal valve)
+                # Movement in YZ plane, X constant
+                for k in range(1, steps+1):
+                    angle = theta_rad * (k / steps)
+                    
+                    # Circular arc: start at (pivot_y + raio, ee_z), rotate towards +Z
+                    new_x = ee_x  # CONSTANT!
+                    new_y = pivot_y + raio * math.cos(angle)
+                    new_z = ee_z + raio * math.sin(angle)
+                    
+                    waypoint = Pose()
+                    waypoint.position.x = float(new_x)
+                    waypoint.position.y = float(new_y)
+                    waypoint.position.z = float(new_z)
+                    waypoint.orientation = ee_orientation
+                    
+                    waypoints.append(waypoint)
+                    
+            elif dominant_axis_idx == 2:  # Z axis (vertical valve)
+                # Movement in XY plane, Z constant
+                for k in range(1, steps+1):
+                    angle = theta_rad * (k / steps)
+                    
+                    # Circular arc in XY plane
+                    angle_initial = math.atan2(dy, dx)
+                    angle_current = angle_initial + angle
+                    
+                    new_x = pivot_x + raio * math.cos(angle_current)
+                    new_y = pivot_y + raio * math.sin(angle_current)
+                    new_z = ee_z  # CONSTANT!
+                    
+                    waypoint = Pose()
+                    waypoint.position.x = float(new_x)
+                    waypoint.position.y = float(new_y)
+                    waypoint.position.z = float(new_z)
+                    waypoint.orientation = ee_orientation
+                    
+                    waypoints.append(waypoint)
+                    
+            else:  # X axis
+                # Movement in XZ plane, Y constant
+                for k in range(1, steps+1):
+                    angle = theta_rad * (k / steps)
+                    
+                    new_x = pivot_x + raio * math.cos(angle)
+                    new_y = ee_y  # CONSTANT!
+                    new_z = ee_z + raio * math.sin(angle)
+                    
+                    waypoint = Pose()
+                    waypoint.position.x = float(new_x)
+                    waypoint.position.y = float(new_y)
+                    waypoint.position.z = float(new_z)
+                    waypoint.orientation = ee_orientation
+                    
+                    waypoints.append(waypoint)
+            
+            # Build GetCartesianPath request
+            req = GetCartesianPath.Request()
+            req.header.frame_id = self.PLANNING_FRAME  # "body" - critical for correct interpretation!
+            req.header.stamp = self.get_clock().now().to_msg()
+            req.start_state.is_diff = True
+            req.group_name = self.PLANNING_GROUP
+            req.link_name = self.END_EFFECTOR_LINK
+            req.waypoints = waypoints
+            req.max_step = float(max_step)         # Interpolation resolution (m)
+            req.jump_threshold = 0.0               # Disable jump filtering (or set > 0)
+            req.avoid_collisions = bool(avoid_collisions)
+            
+            self.get_logger().info(f"Requesting cartesian path: {steps} waypoints, "
+                                   f"+{theta_deg:.1f}° circular arc in XY plane...")
+            
+            # Call service
+            future = self.cartesian_client.call_async(req)
+            res = self.wait_for_future(future, timeout_sec=10.0)
+            
+            if res is None:
+                self.get_logger().error("Timeout calling GetCartesianPath service")
+                return False
+            
+            # Check fraction of path achieved
+            frac = getattr(res, 'fraction', 0.0)
+            self.get_logger().info(f"Cartesian path fraction achieved: {frac*100:.1f}%")
+            
+            if frac < 0.9:
+                self.get_logger().warn("Cartesian path incomplete (<90%). "
+                                       "May fail or stop before completion.")
+            
+            # Execute the returned trajectory
+            if res.solution.joint_trajectory.points:
+                exec_goal = ExecuteTrajectory.Goal()
+                exec_goal.trajectory = res.solution
+                
+                self.get_logger().info("Executing valve rotation trajectory...")
+                send_exec = self.exec_traj_client.send_goal_async(exec_goal)
+                handle = self.wait_for_future(send_exec, timeout_sec=2.0)
+                
+                if handle is None or not handle.accepted:
+                    self.get_logger().error("Failed to accept trajectory execution")
+                    return False
+                
+                result_future = handle.get_result_async()
+                result = self.wait_for_future(result_future, timeout_sec=30.0)
+                
+                if result is None:
+                    self.get_logger().error("Timeout executing cartesian trajectory")
+                    return False
+                
+                self.get_logger().info("Valve rotation executed successfully! ✅")
+                return True
+            else:
+                self.get_logger().error("Empty trajectory returned by GetCartesianPath")
+                return False
+        
+        except Exception as e:
+            self.get_logger().error(f"rotate_valve failed: {e}", exc_info=True)
+            return False
+    
+    def _generate_rotation_waypoints(
+        self,
+        start_pose_stamped: PoseStamped,
+        pivot_frame: str,
+        rotation_axis: str = "z",
+        total_angle_rad: float = -math.pi / 2.0,  # -90 deg for closing
+        num_steps: int = 10,
+    ) -> list:
+        """
+        Generates a list of Cartesian waypoints for a rotation around a pivot.
+        
+        Args:
+            start_pose_stamped: Starting pose of the end effector
+            pivot_frame: Frame to rotate around (e.g., "lever_pivot")
+            rotation_axis: Axis to rotate around ('x', 'y', or 'z')
+            total_angle_rad: Total rotation angle in radians
+            num_steps: Number of waypoints to generate
+            
+        Returns:
+            List of Pose messages representing the waypoints in body frame
+        """
+        self.get_logger().info(
+            f"Generating {num_steps} waypoints for {total_angle_rad:.2f} rad "
+            f"rotation around {pivot_frame}..."
+        )
+        waypoints_in_body_frame = []
+
+        try:
+            transform_body_to_pivot = self.lookup_transform(
+                pivot_frame, self.PLANNING_FRAME, timeout=2.0
+            )
+            transform_pivot_to_body = self.lookup_transform(
+                self.PLANNING_FRAME, pivot_frame, timeout=2.0
+            )
+            if not transform_body_to_pivot or not transform_pivot_to_body:
+                self.get_logger().error("Failed to get pivot transforms.")
+                return None
+
+            start_pose_in_pivot_msg = do_transform_pose(
+                start_pose_stamped.pose, transform_body_to_pivot
+            )
+
+            for i in range(1, num_steps + 1):
+                angle = (total_angle_rad / num_steps) * i
+                if rotation_axis == "x":
+                    q_rot = tf_transformations.quaternion_from_euler(angle, 0, 0)
+                elif rotation_axis == "y":
+                    q_rot = tf_transformations.quaternion_from_euler(0, angle, 0)
+                else:  # 'z'
+                    q_rot = tf_transformations.quaternion_from_euler(0, 0, angle)
+
+                rot_transform_stamped_msg = TransformStamped()
+                rot_transform_stamped_msg.transform.translation.x = 0.0
+                rot_transform_stamped_msg.transform.translation.y = 0.0
+                rot_transform_stamped_msg.transform.translation.z = 0.0
+                rot_transform_stamped_msg.transform.rotation.x = q_rot[0]
+                rot_transform_stamped_msg.transform.rotation.y = q_rot[1]
+                rot_transform_stamped_msg.transform.rotation.z = q_rot[2]
+                rot_transform_stamped_msg.transform.rotation.w = q_rot[3]
+
+                waypoint_in_pivot_msg = do_transform_pose(
+                    start_pose_in_pivot_msg, rot_transform_stamped_msg
+                )
+                waypoint_in_body_msg = do_transform_pose(
+                    waypoint_in_pivot_msg, transform_pivot_to_body
+                )
+                waypoints_in_body_frame.append(waypoint_in_body_msg)
+
+            self.get_logger().info(
+                f"Successfully generated {len(waypoints_in_body_frame)} waypoints."
+            )
+            return waypoints_in_body_frame
+
+        except (TransformException, Exception) as e:
+            self.get_logger().error(f"Failed to generate waypoints: {e}")
+            return None
+
+    def close_valve_cartesian_callback(self, request, response):
+        """
+        Service callback for closing the valve using a computed Cartesian path.
+        
+        Uses the stored grasp pose from a previous grasp_valve call and generates
+        a Cartesian path that rotates the valve around the pivot point.
+        """
+        self.get_logger().info("=" * 50)
+        self.get_logger().info("CLOSE VALVE (CARTESIAN) SERVICE TRIGGERED")
+        self.get_logger().info("=" * 50)
+
+        try:
+            if self.last_grasp_pose is None:
+                response.success = False
+                response.message = "No grasp pose recorded. Run /grasp_valve first."
+                self.get_logger().error(response.message)
+                return response
+
+            waypoints = self._generate_rotation_waypoints(
+                start_pose_stamped=self.last_grasp_pose,
+                pivot_frame="lever_pivot",
+                rotation_axis="y",
+                total_angle_rad=-math.pi / 1.0,  # -90 degrees
+                num_steps=15,
+            )
+            if not waypoints:
+                response.success = False
+                response.message = "Failed to generate Cartesian waypoints."
+                self.get_logger().error(response.message)
+                return response
+
+            cartesian_req = GetCartesianPath.Request()
+            cartesian_req.header.frame_id = self.PLANNING_FRAME
+            cartesian_req.header.stamp = self.get_clock().now().to_msg()
+            cartesian_req.start_state.is_diff = True
+            cartesian_req.group_name = self.PLANNING_GROUP
+            cartesian_req.link_name = self.END_EFFECTOR_LINK
+            cartesian_req.waypoints = waypoints
+            cartesian_req.max_step = 0.10
+            cartesian_req.avoid_collisions = False
+
+            future = self.cartesian_client.call_async(cartesian_req)
+            cartesian_result = self.wait_for_future(future, timeout_sec=10.0)
+            if cartesian_result is None:
+                response.success = False
+                response.message = "Cartesian path service timed out."
+                self.get_logger().error(response.message)
+                return response
+
+            if cartesian_result.fraction < 0.40:
+                response.success = False
+                response.message = f"Failed to compute full Cartesian path (fraction: {cartesian_result.fraction:.2f})."
+                self.get_logger().error(response.message)
+                return response
+
+            robot_trajectory = cartesian_result.solution.joint_trajectory
+            fjt_goal = FollowJointTrajectory.Goal()
+            fjt_goal.trajectory = robot_trajectory
+            send_goal_future = self.fjt_client.send_goal_async(fjt_goal)
+            goal_handle = self.wait_for_future(send_goal_future, timeout_sec=5.0)
+            if goal_handle is None or not goal_handle.accepted:
+                response.success = False
+                response.message = "Trajectory execution goal was rejected or timed out."
+                self.get_logger().error(response.message)
+                return response
+
+            result_future = goal_handle.get_result_async()
+            fjt_result = self.wait_for_future(result_future, timeout_sec=45.0)
+            if fjt_result is None:
+                response.success = False
+                response.message = "Trajectory execution timed out."
+                self.get_logger().error(response.message)
+                return response
+
+            if fjt_result.result.error_code != fjt_result.result.SUCCESSFUL:
+                response.success = False
+                response.message = f"Trajectory execution failed with code: {fjt_result.result.error_code}"
+                self.get_logger().error(response.message)
+                return response
+
+            response.success = True
+            response.message = "Valve closed successfully using Cartesian path!"
+            self.get_logger().info("VALVE CLOSED SUCCESSFULLY!")
+
+        except Exception as e:
+            response.success = False
+            response.message = f"Close valve failed with exception: {str(e)}"
+            self.get_logger().error(response.message)
+        return response
     
     def plan_grasp_callback(self, request, response):
         """
@@ -710,9 +1240,15 @@ class ValveGraspNode(Node):
             self.close_gripper()
             time.sleep(0.5)
             
+            # Step 4: Rotate the valve (+90° circular arc)
+            self.get_logger().info("Step 4: Rotating the valve (+90°)...")
+            ok = self.rotate_valve(theta_deg=90.0, steps=128, axis='z', max_step=0.0008, avoid_collisions=False)
+            if not ok:
+                self.get_logger().warn("Rotation did not complete fully. Check limits/collisions/TF.")
+            
             # Success!
             response.success = True
-            response.message = "Grasp executed successfully!"
+            response.message = "Grasp and valve rotation executed successfully!"
             self.get_logger().info("=" * 50)
             self.get_logger().info("GRASP COMPLETED SUCCESSFULLY!")
             self.get_logger().info("=" * 50)
